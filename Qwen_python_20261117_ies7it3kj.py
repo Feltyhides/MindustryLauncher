@@ -1,7 +1,7 @@
 """
 Telegram Glass: клиент в стиле Telegram Desktop с эффектом жидкого стекла,
 режимом «отправить и удалить», поиском GIF и автоподбором обхода блокировок.
-pip install telethon PySide6 "python-socks[asyncio]" qrcode opencv-python
+pip install telethon PySide6 "python-socks[asyncio]" qrcode opencv-python pillow
 Рядом должен лежать bypass.py
 """
 import asyncio
@@ -9,15 +9,18 @@ import atexit
 import html
 import json
 import math
+import os
+import re
 import sys
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage,
 QLinearGradient, QMovie, QPainter, QPainterPath,
 QPen, QPixmap, QRadialGradient)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDoubleSpinBox,
-QFileDialog, QFrame, QHBoxLayout, QInputDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDateTimeEdit, QDialog, QDoubleSpinBox,
+QFileDialog, QFrame, QFormLayout, QHBoxLayout, QInputDialog,
 QLabel, QLineEdit, QListWidget, QListWidgetItem,
 QMainWindow, QPlainTextEdit, QProgressBar,
 QPushButton, QScrollArea, QSizePolicy, QSpinBox,
@@ -34,9 +37,10 @@ try:
 except ImportError:
     cv2 = None
 
-API_ID = 38658917            # <-- свой api_id с my.telegram.org
-API_HASH = "304998bee9bd63c236dbc891860182eb"    # <-- свой api_hash
-SESSION = "burst_session"
+# Все данные для форка (api_id, api_hash, имя сессии) вводятся прямо в GUI
+# на экране входа и сохраняются в settings.json. Значения по умолчанию можно
+# так же задать через переменные окружения TELEGRAM_API_ID / TELEGRAM_API_HASH.
+DEFAULT_SESSION = "burst_session"
 GIF_BOT = "gif"
 BASE = Path(__file__).resolve().parent
 CACHE_DIR = BASE / "gif_cache"
@@ -45,13 +49,20 @@ SETTINGS = BASE / "settings.json"
 
 def load_settings():
     try:
-        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+        s = json.loads(SETTINGS.read_text(encoding="utf-8"))
+        if not isinstance(s, dict):
+            raise ValueError
     except Exception:
-        return {"bypass": True}
+        s = {}
+    s.setdefault("bypass", True)
+    s.setdefault("session_name", os.environ.get("TELEGRAM_SESSION", DEFAULT_SESSION))
+    s.setdefault("api_id", os.environ.get("TELEGRAM_API_ID", ""))
+    s.setdefault("api_hash", os.environ.get("TELEGRAM_API_HASH", ""))
+    return s
 
 def save_settings(s):
     try:
-        SETTINGS.write_text(json.dumps(s), encoding="utf-8")
+        SETTINGS.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -79,6 +90,7 @@ class Bridge(QObject):
     gif_preview = Signal(object, int, str, str)
     progress = Signal(float)
     burst_done = Signal()
+    pdf_done = Signal(str, int)
 
 # ============================== Telegram worker ==============================
 class TG:
@@ -108,6 +120,24 @@ class TG:
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     # ---------- подключение ----------
+    def _client_params(self):
+        """Актуальные api_id / api_hash / имя сессии (можно менять прямо из GUI)."""
+        try:
+            api_id = int(str(self.settings.get("api_id", "")).strip())
+        except (ValueError, TypeError):
+            api_id = 0
+        api_hash = str(self.settings.get("api_hash", "")).strip()
+        name = str(self.settings.get("session_name", "") or "").strip() or DEFAULT_SESSION
+        return name, api_id, api_hash
+
+    def apply_credentials(self, name, api_id, api_hash):
+        """Сохраняет данные для форка в settings.json и переподключается с ними."""
+        self.settings["session_name"] = name
+        self.settings["api_id"] = api_id
+        self.settings["api_hash"] = api_hash
+        save_settings(self.settings)
+        self.submit(self.startup())
+
     async def try_connect(self, proxy, timeout=10):
         old = self.client
         if old:
@@ -116,7 +146,11 @@ class TG:
             except Exception:
                 pass
             self.client = None
-        c = TelegramClient(SESSION, API_ID, API_HASH, proxy=proxy,
+        name, api_id, api_hash = self._client_params()
+        if not api_id or not api_hash:
+            self.b.status.emit("Заполни API ID и API Hash в блоке «Данные для форка» слева и нажми «Сохранить и подключиться».")
+            return False
+        c = TelegramClient(name, api_id, api_hash, proxy=proxy,
                            connection_retries=1, retry_delay=1, timeout=8)
         try:
             await asyncio.wait_for(c.connect(), timeout)
@@ -274,7 +308,8 @@ class TG:
             if "already used" in msg or "AUTH_RESTART" in msg:
                 self.b.toast.emit(
                     "Telegram попросил начать заново (обычно из-за повторных нажатий). "
-                    "Закрой программу, удали файл burst_session.session, подожди минуту и попробуй снова.")
+                    "Закрой программу, удали файл "
+                    f"{self._client_params()[0]}.session, подожди минуту и попробуй снова.")
             else:
                 self.b.toast.emit(f"Не удалось отправить код: {e}")
             self.b.phone_code_failed.emit()
@@ -333,9 +368,10 @@ class TG:
     async def tdata_login(self, path, account_index=None):
         self.b.status.emit("Переношу авторизацию из Telegram Desktop…")
         passcode = ""
+        sess_name = self._client_params()[0]
         try:
             me, phone = await tdata_import.import_session(
-                path, SESSION, passcode=passcode, account_index=account_index,
+                path, sess_name, passcode=passcode, account_index=account_index,
                 log=self.b.log.emit)
         except RuntimeError as e:
             msg = str(e)
@@ -346,7 +382,7 @@ class TG:
                     return
                 try:
                     me, phone = await tdata_import.import_session(
-                        path, SESSION, passcode=passcode, account_index=account_index,
+                        path, sess_name, passcode=passcode, account_index=account_index,
                         log=self.b.log.emit)
                 except Exception as e2:
                     self.b.tdata_done.emit(False, str(e2))
@@ -554,6 +590,86 @@ class TG:
         b.progress.emit(1.0)
         b.log.emit(f"Готово. Отправлено {counters['sent']}, удалено {counters['del']}")
         b.burst_done.emit()
+
+    # ---------- фото из промежутка -> PDF ----------
+    async def photos_to_pdf(self, entity, dt_from, dt_to, out_path, max_photos=0):
+        """Собирает фотографии чата за выбранный промежуток времени и формирует PDF."""
+        b = self.b
+        try:
+            from PIL import Image
+        except ImportError:
+            b.toast.emit("Для PDF установи Pillow: pip install pillow")
+            b.pdf_done.emit("", 0)
+            return
+        name = utils.get_display_name(entity)
+        b.log.emit(f"PDF: ищу фото в «{name}» с {dt_from:%d.%m.%Y %H:%M} по {dt_to:%d.%m.%Y %H:%M}…")
+        imgs, seen = [], set()
+        total, done = 0, 0
+        try:
+            async for m in self.client.iter_messages(entity, offset_date=dt_to + timedelta(seconds=1),
+                                                     reverse=True):
+                if m.date < dt_from:
+                    break
+                media = m.photo
+                if media is None or getattr(media, "id", None) in seen:
+                    continue
+                seen.add(media.id)
+                total += 1
+                if max_photos and total > max_photos:
+                    total -= 1
+                    break
+                try:
+                    data = await self.client.download_media(media, file=bytes)
+                except FloodWaitError as e:
+                    b.log.emit(f"PDF FloodWait: жду {e.seconds} сек.")
+                    await asyncio.sleep(e.seconds + 1)
+                    try:
+                        data = await self.client.download_media(media, file=bytes)
+                    except Exception:
+                        data = None
+                except Exception:
+                    data = None
+                done += 1
+                b.progress.emit(done / max(total, 1) * 0.95)
+                if not data:
+                    continue
+                try:
+                    import io
+
+                    def _open():
+                        im = Image.open(io.BytesIO(data))
+                        im.load()
+                        return im.convert("RGB")
+
+                    img = await asyncio.get_running_loop().run_in_executor(None, _open)
+                except Exception as e:
+                    b.log.emit(f"PDF: не удалось открыть фото #{m.id}: {e}")
+                    continue
+                imgs.append(img)
+        except Exception as e:
+            b.log.emit(f"PDF: ошибка чтения чата: {e}")
+        if not imgs:
+            b.toast.emit("В выбранном промежутке фотографий нет")
+            b.progress.emit(0)
+            b.pdf_done.emit("", 0)
+            return
+        try:
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+            def _save():
+                first, rest = imgs[0], imgs[1:]
+                first.save(out_path, "PDF", save_all=True, append_images=rest, resolution=120.0)
+
+            await asyncio.get_running_loop().run_in_executor(None, _save)
+        except Exception as e:
+            b.log.emit(f"PDF: ошибка записи файла: {e}")
+            b.toast.emit(f"Не удалось сохранить PDF: {e}")
+            b.pdf_done.emit("", 0)
+            return
+        b.progress.emit(1.0)
+        b.log.emit(f"PDF готов: {out_path} ({len(imgs)} стр.)")
+        b.toast.emit(f"PDF сохранён: {out_path}")
+        b.pdf_done.emit(out_path, len(imgs))
 
 # ============================== Визуальные компоненты ==============================
 QSS = """
@@ -1028,6 +1144,199 @@ class GifPicker(QDialog):
         self._stop_anim()
         super().closeEvent(e)
 
+# ============================== Диалог: фото из чата за промежуток -> PDF =====
+class PdfPicker(QDialog):
+    """Выбор промежутка времени; клиент соберёт фото из чата и сформирует PDF."""
+
+    def __init__(self, parent, tg: TG, bridge: Bridge, chat_name: str, entity):
+        super().__init__(parent)
+        self.setWindowTitle("Фото из чата в PDF")
+        self.resize(560, 470)
+        self.tg, self.entity = tg, entity
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        back = Backdrop(animated=False)
+        outer.addWidget(back)
+        root = QVBoxLayout(back)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+        card = Glass(26, 34)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(22, 18, 22, 18)
+        cl.setSpacing(10)
+        t = QLabel("📄  Фото → PDF")
+        t.setStyleSheet("font-size:19px;font-weight:700;")
+        sub = QLabel(f"Чат: {chat_name}\nВыбери промежуток — клиент возьмёт из него фотографии "
+                     "и сформирует PDF (по одной странице на фото).")
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color:#b8c9de;")
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        now = datetime.now().replace(microsecond=0)
+        self.dt_from = QDateTimeEdit(now - timedelta(days=30))
+        self.dt_to = QDateTimeEdit(now)
+        for w_ in (self.dt_from, self.dt_to):
+            w_.setDisplayFormat("dd.MM.yyyy HH:mm:ss")
+            w_.setCalendarPopup(True)
+        self.sp_max = QSpinBox()
+        self.sp_max.setRange(0, 5000)
+        self.sp_max.setValue(0)
+        self.sp_max.setSpecialValueText("все")
+        self.sp_max.setToolTip("Сколько максимум фотографий взять из промежутка (0 — все)")
+        form.addRow("С:", self.dt_from)
+        form.addRow("По:", self.dt_to)
+        form.addRow("Максимум фото:", self.sp_max)
+        # быстрые пресеты промежутка
+        pr = QHBoxLayout()
+        pr.setSpacing(8)
+        for label, days in (("сутки", 1), ("неделя", 7), ("месяц", 30), ("год", 365)):
+            b_ = QPushButton(label)
+            b_.clicked.connect(lambda _=False, d=days: self._preset(d))
+            pr.addWidget(b_)
+        pr.addStretch(1)
+        self.out_edit = QLineEdit(str(BASE / f"photos_{re.sub(r'[^A-Za-z0-9_-]+', '_', chat_name)[:32]}_"
+                                          f"{now:%Y%m%d_%H%M}.pdf"))
+        self.out_edit.setPlaceholderText("Куда сохранить PDF")
+        b_out = QPushButton("…")
+        b_out.setFixedWidth(44)
+        b_out.clicked.connect(self._pick_out)
+        h_out = QHBoxLayout()
+        h_out.setSpacing(8)
+        h_out.addWidget(self.out_edit, 1)
+        h_out.addWidget(b_out)
+        self.run_btn = QPushButton("Собрать фото и создать PDF")
+        self.run_btn.setObjectName("accent")
+        self.run_btn.setMinimumHeight(44)
+        self.run_btn.clicked.connect(self._go)
+        self.hint = QLabel("")
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color:#9fb4cc;")
+        cl.addWidget(t)
+        cl.addWidget(sub)
+        cl.addLayout(form)
+        cl.addLayout(pr)
+        cl.addWidget(QLabel("Файл PDF:"))
+        cl.addLayout(h_out)
+        cl.addWidget(self.run_btn)
+        cl.addWidget(self.hint)
+        root.addWidget(card)
+        root.addStretch(1)
+        bridge.progress.connect(self._on_progress)
+        bridge.pdf_done.connect(self._on_done)
+
+    def _preset(self, days):
+        end = datetime.now().replace(microsecond=0)
+        self.dt_to.setDateTime(end)
+        self.dt_from.setDateTime(end - timedelta(days=days))
+
+    def _pick_out(self):
+        p, _ = QFileDialog.getSaveFileName(self, "Сохранить PDF как", self.out_edit.text(),
+                                           "PDF (*.pdf)")
+        if p:
+            if not p.lower().endswith(".pdf"):
+                p += ".pdf"
+            self.out_edit.setText(p)
+
+    def _go(self):
+        dt_from = self.dt_from.dateTime().toPython()
+        dt_to = self.dt_to.dateTime().toPython()
+        if dt_from >= dt_to:
+            self.hint.setText("Начало промежутка должно быть раньше конца.")
+            return
+        out = self.out_edit.text().strip()
+        if not out:
+            self.hint.setText("Укажи, куда сохранить PDF.")
+            return
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+        self.run_btn.setEnabled(False)
+        self.hint.setText("Собираю фотографии… не закрывай окно.")
+        self.tg.submit(self.tg.photos_to_pdf(self.entity, dt_from, dt_to, out,
+                                             self.sp_max.value()))
+
+    def _on_progress(self, v):
+        if self.isVisible():
+            self.hint.setText(f"Прогресс: {int(v * 100)}%")
+
+    def _on_done(self, path, n):
+        self.run_btn.setEnabled(True)
+        if path and n:
+            self.hint.setText(f"✅ Готово: {path} ({n} стр.)")
+            self.accept()
+        else:
+            self.hint.setText("Завершено. Фотографий в промежутке не нашлось или произошла ошибка — "
+                              "подробности в журнале.")
+
+# ============================== Диалог: данные для форка (настройки) ==========
+class SettingsDialog(QDialog):
+    """Ввод и сохранение api_id / api_hash / имени сессии прямо из GUI."""
+
+    def __init__(self, parent, tg: TG):
+        super().__init__(parent)
+        self.setWindowTitle("Данные для форка")
+        self.resize(460, 330)
+        self.tg = tg
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        back = Backdrop(animated=False)
+        outer.addWidget(back)
+        root = QVBoxLayout(back)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+        card = Glass(26, 34)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(22, 18, 22, 18)
+        cl.setSpacing(10)
+        t = QLabel("⚙️ Данные для форка")
+        t.setStyleSheet("font-size:19px;font-weight:700;")
+        hint = QLabel("Получить на my.telegram.org. Всё сохраняется в settings.json рядом с программой.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#b8c9de;")
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        s_ = tg.settings
+        self.ed_id = QLineEdit(str(s_.get("api_id", "") or ""))
+        self.ed_id.setPlaceholderText("API ID — число")
+        self.ed_hash = QLineEdit(str(s_.get("api_hash", "") or ""))
+        self.ed_hash.setPlaceholderText("API HASH — 32 hex-символа")
+        self.ed_sess = QLineEdit(str(s_.get("session_name", "") or DEFAULT_SESSION))
+        self.ed_sess.setPlaceholderText("Имя файла сессии (без .session)")
+        form.addRow("API ID:", self.ed_id)
+        form.addRow("API Hash:", self.ed_hash)
+        form.addRow("Сессия:", self.ed_sess)
+        btns = QHBoxLayout()
+        b_ok = QPushButton("💾 Сохранить и переподключиться")
+        b_ok.setObjectName("accent")
+        b_ok.clicked.connect(self._save)
+        b_cancel = QPushButton("Отмена")
+        b_cancel.clicked.connect(self.reject)
+        btns.addWidget(b_ok)
+        btns.addWidget(b_cancel)
+        cl.addWidget(t)
+        cl.addWidget(hint)
+        cl.addLayout(form)
+        cl.addLayout(btns)
+        root.addWidget(card)
+        root.addStretch(1)
+
+    def _save(self):
+        raw_id = self.ed_id.text().strip()
+        api_hash = self.ed_hash.text().strip()
+        name = re.sub(r"[^\w\-\.]", "_", self.ed_sess.text().strip()) or DEFAULT_SESSION
+        if not raw_id.isdigit():
+            self.tg.b.toast.emit("API ID должен быть числом")
+            return
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+            self.tg.b.toast.emit("API Hash — 32 hex-символа")
+            return
+        self.ed_sess.setText(name)
+        # сохраняем и переподключаемся уже с новыми данными
+        self.tg.apply_credentials(name, raw_id, api_hash.lower())
+        self.tg.b.toast.emit(f"Данные сохранены, сессия: {name}")
+        self.accept()
+
 # ============================== Главное окно ==============================
 class Main(QMainWindow):
     def __init__(self):
@@ -1061,11 +1370,16 @@ class Main(QMainWindow):
         self.me_lbl.setStyleSheet("color:#9fb4cc;")
         self.pill = BypassPill()
         self.pill.clicked.connect(self._toggle_bypass)
+        b_set = QPushButton("⚙")
+        b_set.setObjectName("round")
+        b_set.setToolTip("Данные для форка: API ID / API Hash / сессия (сохраняются)")
+        b_set.clicked.connect(self._open_settings)
         tl.addWidget(logo)
         tl.addWidget(title)
         tl.addSpacing(10)
         tl.addWidget(self.me_lbl)
         tl.addStretch(1)
+        tl.addWidget(b_set)
         tl.addWidget(self.pill)
         root.addWidget(top)
         self.stack = QStackedWidget()
@@ -1105,7 +1419,7 @@ class Main(QMainWindow):
         lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card = Glass(32, 36)
         # Увеличил карточку: теперь QR и форма номера помещаются в горизонтальном layout
-        card.setFixedSize(760, 560)
+        card.setFixedSize(800, 720)
         cl = QVBoxLayout(card)
         cl.setContentsMargins(30, 30, 30, 30)
         cl.setSpacing(14)
@@ -1174,12 +1488,70 @@ class Main(QMainWindow):
         b_td.clicked.connect(self._tdata_scan)
         b_td.setToolTip("Найдёт установленный Telegram Desktop и перенесёт вход без QR")
 
+        # --- данные для форка: api_id / api_hash / имя сессии (сохраняются в settings.json) ---
+        s_ = self.tg.settings
+        cred_box = Glass(20, 26)
+        cl.addWidget(cred_box)
+        cform = QFormLayout()
+        cform.setSpacing(8)
+        cform.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        cap = QLabel("⚙️ Данные для форка")
+        cap.setStyleSheet("font-size:14px;font-weight:600;color:#b8c9de;")
+        self.ed_api_id = QLineEdit(str(s_.get("api_id", "") or ""))
+        self.ed_api_id.setPlaceholderText("API ID — число с my.telegram.org")
+        self.ed_api_hash = QLineEdit(str(s_.get("api_hash", "") or ""))
+        self.ed_api_hash.setPlaceholderText("API HASH — hex-строка с my.telegram.org")
+        self.ed_session = QLineEdit(str(s_.get("session_name", "") or DEFAULT_SESSION))
+        self.ed_session.setPlaceholderText("Имя файла сессии (без .session)")
+        self.chk_show_cred = QCheckBox("Показывать")
+        self.ed_api_hash.setEchoMode(QLineEdit.EchoMode.Password)
+        self.chk_show_cred.toggled.connect(
+            lambda on: self.ed_api_hash.setEchoMode(
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        cform.addRow("API ID:", self.ed_api_id)
+        cform.addRow("API Hash:", self.ed_api_hash)
+        cform.addRow("Сессия:", self.ed_session)
+        b_cred = QPushButton("💾 Сохранить и подключиться")
+        b_cred.setObjectName("accent")
+        b_cred.clicked.connect(self._save_credentials)
+        cred_in = QVBoxLayout(cred_box)
+        cred_in.setContentsMargins(16, 12, 16, 12)
+        cred_in.setSpacing(6)
+        cred_in.insertWidget(0, cap)
+        cred_in.addLayout(cform)
+        row_show = QHBoxLayout()
+        row_show.addWidget(self.chk_show_cred)
+        row_show.addStretch(1)
+        cred_in.addLayout(row_show)
+        cred_in.addWidget(b_cred)
+
         cl.addWidget(t)
         cl.addLayout(h_lay, 1)
         cl.addWidget(self.login_status)
         cl.addWidget(b_td)
         lay.addWidget(card)
         return page
+
+    # ---------- данные для форка (api_id / api_hash / сессия) ----------
+    def _save_credentials(self):
+        raw_id = self.ed_api_id.text().strip()
+        api_hash = self.ed_api_hash.text().strip()
+        name = re.sub(r"[^\w\-\.]", "_", self.ed_session.text().strip()) or DEFAULT_SESSION
+        if not raw_id.isdigit():
+            self._toast("API ID должен быть числом (смотри my.telegram.org)")
+            return
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+            self._toast("API Hash — 32 hex-символа с my.telegram.org")
+            return
+        self.tg.settings["session_name"] = name
+        self.tg.settings["api_id"] = raw_id
+        self.tg.settings["api_hash"] = api_hash.lower()
+        save_settings(self.tg.settings)
+        self.ed_session.setText(name)
+        self.login_status.setText(f"Данные сохранены в settings.json. Подключаюсь, сессия «{name}»…")
+        self._b_code.setEnabled(True)
+        self._b_code.setText("Отправить код")
+        self.tg.submit(self.tg.startup())
 
     # ---------- вход по телефону ----------
     def _send_code(self):
@@ -1442,6 +1814,10 @@ class Main(QMainWindow):
         b_gif.setObjectName("round")
         b_gif.setStyleSheet("font-size:12px;font-weight:700;")
         b_gif.clicked.connect(self._open_gif)
+        b_pdf = QPushButton("📄")
+        b_pdf.setObjectName("round")
+        b_pdf.setToolTip("Сохранить фотографии чата за выбранный промежуток в PDF")
+        b_pdf.clicked.connect(self._open_pdf)
         self.input = QLineEdit()
         self.input.setPlaceholderText("Сообщение или подпись")
         self.input.returnPressed.connect(self._send)
@@ -1453,7 +1829,7 @@ class Main(QMainWindow):
         b_send.setObjectName("round")
         b_send.setToolTip("Отправить обычное сообщение")
         b_send.clicked.connect(self._send)
-        for w_ in (b_file, b_gif):
+        for w_ in (b_file, b_gif, b_pdf):
             cl.addWidget(w_)
         cl.addWidget(self.input, 1)
         cl.addWidget(self.b_burst)
@@ -1594,6 +1970,15 @@ class Main(QMainWindow):
 
     def _open_gif(self):
         GifPicker(self, self.tg, self.b, self._gif_picked).show()
+
+    def _open_pdf(self):
+        if not self._need_chat():
+            return
+        PdfPicker(self, self.tg, self.b, self.cur["name"], self.cur["entity"]).show()
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self, self.tg)
+        dlg.exec()
 
     def _gif_picked(self, pm):
         self.use_gif, self.file_path = True, None
